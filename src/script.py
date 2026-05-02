@@ -641,6 +641,18 @@ def _is_likely_heading(line: str, prev: str, nxt: str) -> bool:
     return True
 
 
+def _maybe_clear_mps_after_page(engine_name: str) -> None:
+    """Release pooled MPS memory between pages — mitigates long-run growth on Apple Silicon."""
+    if engine_name != "surya":
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
 # ---------- driver ----------
 
 def ocr_pdf(
@@ -686,6 +698,7 @@ def ocr_pdf(
             else:
                 f.write("_(no text detected)_")
             f.write("\n")
+            _maybe_clear_mps_after_page(engine_name)
     doc.close()
     log.info("Wrote %s", out_path)
 
