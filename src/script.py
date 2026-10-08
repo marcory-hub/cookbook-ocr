@@ -17,6 +17,7 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ import shutil
 import sys
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 import cv2
 import fitz  # PyMuPDF
@@ -113,6 +115,54 @@ FRACTION_FIXUPS: list[tuple[re.Pattern, str]] = [
 ]
 
 log = logging.getLogger("cookbook-ocr")
+
+PAGE_HEADER_RE = re.compile(r"^##\s+Page\s+(\d+)\s*$", re.MULTILINE)
+SURYA_BATCH_SIZE = 2
+
+
+def count_pages_in_md(text: str) -> int:
+    return len(PAGE_HEADER_RE.findall(text))
+
+
+def _last_checkpoint_page(checkpoint_path: Path) -> int:
+    last = 0
+    if not checkpoint_path.exists():
+        return 0
+    for line in checkpoint_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                last = max(last, int(json.loads(line).get("page", 0)))
+            except json.JSONDecodeError:
+                continue
+    return last
+
+
+def _append_checkpoint(checkpoint_path: Path, record: dict[str, Any]) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with checkpoint_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _finalize_tmp(tmp_path: Path, out_path: Path, checkpoint_path: Path | None) -> None:
+    """Promote ``.tmp`` markdown to final path after fsync."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    tmp_path.replace(out_path)
+    try:
+        dir_fd = os.open(out_path.parent, os.O_RDONLY)
+    except OSError:
+        dir_fd = None
+    if dir_fd is not None:
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    if checkpoint_path is not None and checkpoint_path.exists():
+        checkpoint_path.unlink()
 
 
 # ---------- rasterization ----------
@@ -330,7 +380,13 @@ def best_ocr(img: Image.Image, lang: str, extra_cfg: str) -> tuple[str, float, i
 
 
 def best_ocr_layout_aware(
-    bgr: np.ndarray, src_dpi: int, lang: str, extra_cfg: str
+    bgr: np.ndarray,
+    src_dpi: int,
+    lang: str,
+    extra_cfg: str,
+    *,
+    force_cols: bool = False,
+    col_min_conf: float = 55.0,
 ) -> tuple[str, float, str]:
     """
     Detect columns and pick the highest-confidence variant among:
@@ -379,7 +435,8 @@ def best_ocr_layout_aware(
         multi_text = "\n\n".join(t for t in col_texts if t.strip())
         # When multiple columns are detected, reading order matters more than
         # marginal confidence — prefer columns unless they fail badly.
-        if multi_text.strip() and multi_conf >= 55:
+        min_conf = col_min_conf if force_cols else 55.0
+        if multi_text.strip() and (force_cols or multi_conf >= min_conf):
             return multi_text, multi_conf, f"cols-{len(columns)}"
 
     # Single-column page (or column mode failed): pick best of full/hard.
@@ -643,7 +700,7 @@ def _is_likely_heading(line: str, prev: str, nxt: str) -> bool:
 
 def _maybe_clear_mps_after_page(engine_name: str) -> None:
     """Release pooled MPS memory between pages — mitigates long-run growth on Apple Silicon."""
-    if engine_name != "surya":
+    if engine_name not in ("surya", "surya-layout"):
         return
     try:
         import torch
@@ -663,10 +720,27 @@ def ocr_pdf(
     extra_cfg: str,
     engine_name: str = "tesseract",
     surya_engine=None,
+    surya_layout_engine=None,
+    checkpoint_path: Path | None = None,
+    batch_size: int = SURYA_BATCH_SIZE,
 ) -> None:
     log.info("Processing %s", pdf_path.name)
     doc = fitz.open(pdf_path)
     total = doc.page_count
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    ckpt = checkpoint_path or out_path.with_suffix(out_path.suffix + ".checkpoint.jsonl")
+
+    start_page = _last_checkpoint_page(ckpt) + 1
+    if start_page > total:
+        if tmp_path.exists():
+            pages_done = count_pages_in_md(tmp_path.read_text(encoding="utf-8", errors="replace"))
+            if pages_done >= total:
+                doc.close()
+                _finalize_tmp(tmp_path, out_path, ckpt)
+                log.info("Finalized %s (%d pages) from checkpoint", out_path, pages_done)
+                return
+        log.warning("Checkpoint past end but %s incomplete; restarting", tmp_path.name)
+        start_page = 1
 
     header = [
         f"# {pdf_path.stem}",
@@ -676,31 +750,115 @@ def ocr_pdf(
         "---",
         "",
     ]
-    with out_path.open("w", encoding="utf-8") as f:
-        f.write("\n".join(header))
-        for i, page in enumerate(doc, start=1):
+
+    if start_page == 1 and tmp_path.exists():
+        tmp_path.unlink()
+    if start_page == 1:
+        tmp_path.write_text("\n".join(header), encoding="utf-8")
+    elif not tmp_path.exists():
+        log.warning("Checkpoint at page %d but %s missing; restarting", start_page - 1, tmp_path.name)
+        start_page = 1
+        tmp_path.write_text("\n".join(header), encoding="utf-8")
+        if ckpt.exists():
+            ckpt.unlink()
+
+    page_indices = list(range(start_page, total + 1))
+    i = 0
+    while i < len(page_indices):
+        batch_pages = page_indices[i : i + max(1, batch_size)]
+        bgr_batch: list[np.ndarray] = []
+        for pn in batch_pages:
+            page = doc[pn - 1]
             bgr = render_page(page, dpi)
             bgr = correct_orientation(bgr)
-            if engine_name == "surya" and surya_engine is not None:
-                from surya_engine import assemble_markdown
-                lines, conf = surya_engine.ocr_page(bgr)
-                # assemble_markdown emits finished markdown (headings, bullets,
-                # joined prose); clean_text would damage the bullet markers.
+            bgr_batch.append(bgr)
+
+        if engine_name == "surya-layout" and surya_layout_engine is not None:
+            from surya_engine import SuryaEngine
+
+            try:
+                layout_results = surya_layout_engine.ocr_pages(
+                    bgr_batch,
+                    page_nums=list(batch_pages),
+                    batch_size=len(bgr_batch),
+                )
+            except Exception as exc:
+                log.warning("Surya-layout batch failed (%s); retrying page-by-page", exc)
+                layout_results = surya_layout_engine.ocr_pages(
+                    bgr_batch,
+                    page_nums=list(batch_pages),
+                    batch_size=1,
+                )
+            page_outputs: list[tuple[str, float, str]] = []
+            for result in layout_results:
+                mode = f"surya-layout/{result.layout_class}"
+                if result.orphan_count:
+                    mode += f"+orphans:{result.orphan_count}"
+                if result.low_confidence:
+                    mode += "+low_conf"
+                page_outputs.append((result.markdown, result.mean_confidence, mode))
+            SuryaEngine.clear_mps_cache()
+        elif engine_name == "surya" and surya_engine is not None:
+            from surya_engine import SuryaEngine, assemble_markdown
+
+            if len(bgr_batch) > 1 and hasattr(surya_engine, "ocr_pages"):
+                try:
+                    ocr_results = surya_engine.ocr_pages(bgr_batch, batch_size=len(bgr_batch))
+                except Exception as exc:
+                    log.warning("Surya batch failed (%s); retrying page-by-page", exc)
+                    ocr_results = surya_engine.ocr_pages(bgr_batch, batch_size=1)
+            else:
+                ocr_results = [
+                    surya_engine.ocr_page(bgr) for bgr in bgr_batch
+                ]
+            page_outputs = []
+            for bgr, (lines, conf) in zip(bgr_batch, ocr_results):
                 cleaned = assemble_markdown(lines, page_width=bgr.shape[1])
-                mode = f"surya/{len(lines)}lines"
-            else:
-                text, conf, mode = best_ocr_layout_aware(bgr, dpi, lang, extra_cfg)
-                cleaned = clean_text(text)
-            log.info("  page %3d/%d  conf=%.1f  mode=%s  chars=%d", i, total, conf, mode, len(cleaned))
-            f.write(f"\n## Page {i}\n\n")
-            if cleaned:
-                f.write(cleaned)
-            else:
-                f.write("_(no text detected)_")
-            f.write("\n")
-            _maybe_clear_mps_after_page(engine_name)
+                page_outputs.append((cleaned, conf, f"surya/{len(lines)}lines"))
+        else:
+            page_outputs = []
+            force_cols = engine_name == "tesseract-cols"
+            col_min = 45.0 if force_cols else 55.0
+            for bgr in bgr_batch:
+                text, conf, mode = best_ocr_layout_aware(
+                    bgr,
+                    dpi,
+                    lang,
+                    extra_cfg,
+                    force_cols=force_cols,
+                    col_min_conf=col_min,
+                )
+                page_outputs.append((clean_text(text), conf, mode))
+
+        with tmp_path.open("a", encoding="utf-8") as f:
+            for pn, (cleaned, conf, mode) in zip(batch_pages, page_outputs):
+                log.info(
+                    "  page %3d/%d  conf=%.1f  mode=%s  chars=%d",
+                    pn, total, conf, mode, len(cleaned),
+                )
+                f.write(f"\n## Page {pn}\n\n")
+                f.write(cleaned if cleaned else "_(no text detected)_")
+                f.write("\n")
+                _append_checkpoint(
+                    ckpt,
+                    {"page": pn, "conf": conf, "mode": mode, "chars": len(cleaned)},
+                )
+        if engine_name == "surya" and surya_engine is not None:
+            from surya_engine import SuryaEngine
+
+            SuryaEngine.clear_mps_cache()
+        i += len(batch_pages)
+
     doc.close()
-    log.info("Wrote %s", out_path)
+    pages_written = count_pages_in_md(tmp_path.read_text(encoding="utf-8", errors="replace"))
+    if pages_written >= total:
+        _finalize_tmp(tmp_path, out_path, ckpt)
+        log.info("Wrote %s (%d pages)", out_path, pages_written)
+    else:
+        log.warning(
+            "Partial write: %d/%d pages in %s (resume on next run)",
+            pages_written, total, tmp_path.name,
+        )
 
 
 def check_tesseract() -> None:
@@ -726,11 +884,32 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Re-OCR even if markdown exists.")
     parser.add_argument(
         "--engine",
-        choices=("tesseract", "surya"),
-        default="surya",
-        help="OCR engine. Surya is transformer-based, higher accuracy, slower.",
+        choices=("tesseract", "surya", "tesseract-cols", "surya-layout"),
+        default="surya-layout",
+        help=(
+            "OCR engine (default: surya-layout). LayoutPredictor for reading "
+            "order and header/footer drop; tesseract-cols forces column split."
+        ),
+    )
+    parser.add_argument(
+        "--low-confidence-threshold",
+        type=float,
+        default=70.0,
+        help="surya-layout: flag pages whose mean line confidence is below this (0-100).",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=SURYA_BATCH_SIZE,
+        help="Surya pages per inference batch (2 recommended on 16GB MPS).",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Directory for per-book checkpoint JSONL (default: beside output .md).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -765,9 +944,15 @@ def main() -> int:
             extra_cfg += f" --user-words {user_words}"
 
     surya_engine = None
+    surya_layout_engine = None
     if args.engine == "surya":
         from surya_engine import SuryaEngine
         surya_engine = SuryaEngine()
+    elif args.engine == "surya-layout":
+        from surya_layout_engine import SuryaLayoutEngine
+        surya_layout_engine = SuryaLayoutEngine(
+            low_confidence_threshold=args.low_confidence_threshold,
+        )
     else:
         check_tesseract()
 
@@ -779,10 +964,37 @@ def main() -> int:
 
     for pdf in pdfs:
         md = args.out / f"{pdf.stem}.md"
+        tmp = md.with_suffix(md.suffix + ".tmp")
+        doc = fitz.open(pdf)
+        page_count = doc.page_count
+        doc.close()
+
         if md.exists() and not args.force:
-            log.info("Skipping %s (exists; --force to re-run)", md.name)
-            continue
-        ocr_pdf(pdf, md, args.dpi, args.lang, extra_cfg, args.engine, surya_engine)
+            complete = count_pages_in_md(md.read_text(encoding="utf-8", errors="replace"))
+            if complete >= page_count:
+                log.info("Skipping %s (complete: %d/%d pages)", md.name, complete, page_count)
+                continue
+            log.info(
+                "Resuming partial %s (%d/%d pages; tmp=%s)",
+                md.name, complete, page_count, tmp.exists(),
+            )
+        elif tmp.exists() and not args.force:
+            log.info("Resuming in-progress %s from %s", md.name, tmp.name)
+
+        ckpt_dir = args.checkpoint_dir or md.parent
+        checkpoint = ckpt_dir / f"{pdf.stem}.checkpoint.jsonl"
+        ocr_pdf(
+            pdf,
+            md,
+            args.dpi,
+            args.lang,
+            extra_cfg,
+            args.engine,
+            surya_engine,
+            surya_layout_engine=surya_layout_engine,
+            checkpoint_path=checkpoint,
+            batch_size=max(1, args.batch_size),
+        )
 
     return 0
 

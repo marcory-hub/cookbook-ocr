@@ -23,4 +23,4 @@ input/*.pdf
 output/
 
 # Tesseract language data (download via instructions in README)
-tessdata_best/
+tessdata_best

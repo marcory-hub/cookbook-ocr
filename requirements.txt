@@ -7,5 +7,5 @@ wordfreq>=3.1
 scikit-image>=0.24
 # Surya OCR engine (default). Pulls torch + transformers; first run
 # downloads ~1.5GB of model weights to the user data cache.
-surya-ocr>=0.17
+surya-ocr>=0.17,<0.18
 transformers<5

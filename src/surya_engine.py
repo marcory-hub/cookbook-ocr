@@ -44,50 +44,150 @@ class SuryaLine:
     confidence: float
 
 
+def _html_to_plain(html: str) -> str:
+    """Extract plain text from Surya block HTML (0.20+)."""
+    if not html or not html.strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(html, "html.parser").get_text("\n", strip=True)
+    except Exception:
+        return _OTHER_TAGS.sub("", html).strip()
+
+
 class SuryaEngine:
     """Lazy-loaded Surya predictors shared across pages."""
 
     def __init__(self) -> None:
-        self._foundation = None
         self._recognition = None
         self._detection = None
+        self._api: str = ""  # "v017" torch/MPS | "v020" VLM/llamacpp
 
     def _load(self) -> None:
         if self._recognition is not None:
             return
-        log.info("Loading Surya models (first run downloads ~1.5GB)...")
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-        from surya.detection import DetectionPredictor
+        log.info("Loading Surya models (first run downloads weights on first use)...")
+        try:
+            from surya.foundation import FoundationPredictor
+            from surya.detection import DetectionPredictor
+            from surya.recognition import RecognitionPredictor
 
-        self._foundation = FoundationPredictor()
-        self._recognition = RecognitionPredictor(self._foundation)
-        self._detection = DetectionPredictor()
-        log.info("Surya models ready.")
+            foundation = FoundationPredictor()
+            self._recognition = RecognitionPredictor(foundation)
+            self._detection = DetectionPredictor()
+            self._api = "v017"
+        except ImportError:
+            from surya.recognition import RecognitionPredictor
+
+            self._recognition = RecognitionPredictor()
+            self._api = "v020"
+        log.info("Surya models ready (%s).", self._api)
 
     def ocr_page(self, bgr: np.ndarray) -> tuple[list[SuryaLine], float]:
         """OCR a BGR numpy image. Returns (lines_in_reading_order, mean_conf)."""
         self._load()
-        # Surya takes PIL RGB.
         if bgr.ndim == 3 and bgr.shape[2] == 3:
             rgb = bgr[:, :, ::-1]
         else:
             rgb = bgr
         pil = Image.fromarray(rgb)
-        preds = self._recognition([pil], det_predictor=self._detection)
-        result = preds[0]
 
-        lines: list[SuryaLine] = []
-        confs: list[float] = []
+        if self._api == "v020":
+            preds = self._recognition([pil], full_page=True)
+            result = preds[0]
+            lines: list[SuryaLine] = []
+            confs: list[float] = []
+            for blk in sorted(result.blocks, key=lambda b: b.reading_order):
+                if blk.skipped or blk.error:
+                    continue
+                text = _clean_surya_text(_html_to_plain(blk.html))
+                if not text.strip():
+                    continue
+                bbox = tuple(blk.bbox)
+                conf = float(blk.confidence or 0.0)
+                lines.append(SuryaLine(text=text, bbox=bbox, confidence=conf))
+                confs.append(conf)
+            mean_conf = float(np.mean(confs)) * 100.0 if confs else 0.0
+            return lines, mean_conf
+
+        preds = self._recognition(
+            [pil], det_predictor=self._detection, sort_lines=True
+        )
+        result = preds[0]
+        lines = []
+        confs = []
         for ln in result.text_lines:
             text = _clean_surya_text(ln.text)
             if not text.strip():
                 continue
-            bbox = tuple(ln.bbox)  # (x0, y0, x1, y1)
-            lines.append(SuryaLine(text=text, bbox=bbox, confidence=float(ln.confidence)))
-            confs.append(float(ln.confidence))
+            bbox = tuple(ln.bbox)
+            lines.append(SuryaLine(text=text, bbox=bbox, confidence=float(ln.confidence or 0)))
+            confs.append(float(ln.confidence or 0))
         mean_conf = float(np.mean(confs)) * 100.0 if confs else 0.0
         return lines, mean_conf
+
+    def ocr_pages(
+        self,
+        bgr_images: list[np.ndarray],
+        *,
+        batch_size: int = 2,
+    ) -> list[tuple[list[SuryaLine], float]]:
+        """OCR multiple pages; batch through Surya where the API allows."""
+        if not bgr_images:
+            return []
+        if batch_size < 1:
+            batch_size = 1
+        out: list[tuple[list[SuryaLine], float]] = []
+        for start in range(0, len(bgr_images), batch_size):
+            chunk = bgr_images[start : start + batch_size]
+            if batch_size == 1 or self._api == "v020":
+                for bgr in chunk:
+                    out.append(self.ocr_page(bgr))
+            else:
+                out.extend(self._ocr_page_batch_v017(chunk))
+            self.clear_mps_cache()
+        return out
+
+    def _ocr_page_batch_v017(
+        self, bgr_images: list[np.ndarray]
+    ) -> list[tuple[list[SuryaLine], float]]:
+        self._load()
+        pils: list[Image.Image] = []
+        for bgr in bgr_images:
+            rgb = bgr[:, :, ::-1] if bgr.ndim == 3 and bgr.shape[2] == 3 else bgr
+            pils.append(Image.fromarray(rgb))
+        preds = self._recognition(
+            pils, det_predictor=self._detection, sort_lines=True
+        )
+        results: list[tuple[list[SuryaLine], float]] = []
+        for result in preds:
+            lines: list[SuryaLine] = []
+            confs: list[float] = []
+            for ln in result.text_lines:
+                text = _clean_surya_text(ln.text)
+                if not text.strip():
+                    continue
+                lines.append(
+                    SuryaLine(
+                        text=text,
+                        bbox=tuple(ln.bbox),
+                        confidence=float(ln.confidence or 0),
+                    )
+                )
+                confs.append(float(ln.confidence or 0))
+            mean_conf = float(np.mean(confs)) * 100.0 if confs else 0.0
+            results.append((lines, mean_conf))
+        return results
+
+    @staticmethod
+    def clear_mps_cache() -> None:
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
 
 def _math_to_unicode(match: re.Match) -> str:
